@@ -3,366 +3,350 @@ from odoo import api, fields, models, _
 
 _logger = logging.getLogger(__name__)
 
-
 class ResConfigSettings(models.TransientModel):
     _inherit = 'res.config.settings'
 
-    def remove_data(self, o, s=[]):
-        for line in o:
+    def _execute_sql(self, query, params=None):
+        """Helper to execute SQL safely."""
+        try:
+            self.env.cr.execute(query, params)
+            self.env.cr.commit()  # Force commit to ensure deletion
+        except Exception as e:
+            _logger.error("SQL Error: %s -> %s", query, e)
+            self.env.cr.rollback()
+
+    def _truncate_table(self, table_name):
+        """Truncate table if possible, otherwise delete."""
+        try:
+            # Check if table exists
+            self.env.cr.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s);", (table_name,))
+            if not self.env.cr.fetchone()[0]:
+                return
+            
+            # Try TRUNCATE CASCADE (Fastest, removes all data and resets IDs)
+            # Note: TRUNCATE cannot be used if there are active transactions referencing it in some PG configs, 
+            # but usually works in Odoo context if we commit frequently.
+            self.env.cr.execute(f"TRUNCATE TABLE {table_name} RESTART IDENTITY CASCADE;")
+            self.env.cr.commit()
+        except Exception as e:
+            _logger.warning("Truncate failed for %s, falling back to DELETE. Error: %s", table_name, e)
             try:
-                if not self.env['ir.model']._get(line):
-                    continue
-            except Exception as e:
-                _logger.warning('remove data error get ir.model: %s,%s', line, e)
-                continue
-            obj_name = line
-            obj = self.pool.get(obj_name)
-            if not obj:
-                t_name = obj_name.replace('.', '_')
-            else:
-                t_name = obj._table
-            sql = "delete from %s" % t_name
-            try:
-                self._cr.execute(sql)
-                self._cr.commit()
-            except Exception as e:
-                _logger.warning('remove data error: %s,%s', line, e)
-        for line in s:
-            domain = ['|', ('code', '=ilike', line + '%'), ('prefix', '=ilike', line + '%')]
-            try:
-                seqs = self.env['ir.sequence'].sudo().search(domain)
-                if seqs.exists():
-                    seqs.write({
-                        'number_next': 1,
-                    })
-            except Exception as e:
-                _logger.warning('reset sequence data error: %s,%s', line, e)
-        return True
-    
+                self.env.cr.execute(f"DELETE FROM {table_name};")
+                self.env.cr.commit()
+            except Exception as e2:
+                _logger.error("Delete failed for %s: %s", table_name, e2)
+
+    def _reset_sequences(self, prefixes):
+        """Reset sequences based on prefixes."""
+        for prefix in prefixes:
+            domain = [
+                '|', ('code', '=ilike', f'{prefix}%'),
+                ('prefix', '=ilike', f'{prefix}%')
+            ]
+            seqs = self.env['ir.sequence'].sudo().search(domain)
+            if seqs:
+                seqs.write({'number_next': 1})
+                _logger.info("Reset sequences for prefix: %s", prefix)
+
     def remove_sales(self):
-        to_removes = [
-            'sale.order.line',
-            'sale.order',
-        ]
-        seqs = [
-            'sale',
-        ]
-        return self.remove_data(to_removes, seqs)
+        tables = ['sale_order_line', 'sale_order']
+        for t in tables:
+            self._truncate_table(t)
+        self._reset_sequences(['sale'])
+        return True
 
     def remove_product(self):
-        to_removes = [
-            'product.product',
-            'product.template',
-        ]
-        seqs = [
-            'product.product',
-        ]
-        return self.remove_data(to_removes, seqs)
+        # Must delete product.product before product.template
+        tables = ['product_product', 'product_template']
+        for t in tables:
+            self._truncate_table(t)
+        self._reset_sequences(['product.product'])
+        return True
 
     def remove_product_attribute(self):
-        to_removes = [
-            'product.attribute.value',
-            'product.attribute',
-        ]
-        seqs = []
-        return self.remove_data(to_removes, seqs)
+        tables = ['product_attribute_value', 'product_attribute']
+        for t in tables:
+            self._truncate_table(t)
+        return True
 
     def remove_pos(self):
-        to_removes = [
-            'pos.payment',
-            'pos.order.line',
-            'pos.order',
-            'pos.session',
+        tables = [
+            'pos_payment',
+            'pos_order_line',
+            'pos_order',
+            'pos_session',
         ]
-        seqs = [
-            'pos.',
-        ]
-        res = self.remove_data(to_removes, seqs)
+        for t in tables:
+            self._truncate_table(t)
+        self._reset_sequences(['pos'])
+        
+        # Clean up related bank statements if they were created by POS
         try:
-            statement = self.env['account.bank.statement'].sudo().search([])
-            for s in statement:
-                s._end_balance()
-        except Exception as e:
-            _logger.error('reset sequence data error: %s', e)
-        return res
+            self.env.cr.execute("DELETE FROM account_bank_statement_line WHERE pos_session_id IS NOT NULL;")
+            self.env.cr.commit()
+        except:
+            pass
+        return True
 
     def remove_purchase(self):
-        to_removes = [
-            'purchase.order.line',
-            'purchase.order',
-            'purchase.requisition.line',
-            'purchase.requisition',
+        tables = [
+            'purchase_order_line',
+            'purchase_order',
+            'purchase_requisition_line',
+            'purchase_requisition',
         ]
-        seqs = [
-            'purchase.',
-        ]
-        return self.remove_data(to_removes, seqs)
+        for t in tables:
+            self._truncate_table(t)
+        self._reset_sequences(['purchase'])
+        return True
 
     def remove_expense(self):
-        to_removes = [
-            'hr.expense.sheet',
-            'hr.expense',
-            'hr.payslip',
-            'hr.payslip.run',
+        tables = [
+            'hr_expense_sheet',
+            'hr_expense',
+            'hr_payslip',
+            'hr_payslip_run',
         ]
-        seqs = [
-            'hr.expense.',
-        ]
-        return self.remove_data(to_removes, seqs)
+        for t in tables:
+            self._truncate_table(t)
+        self._reset_sequences(['hr.expense'])
+        return True
 
     def remove_mrp(self):
-        to_removes = [
-            'mrp.workcenter.productivity',
-            'mrp.workorder',
-            'mrp.production.workcenter.line',
-            'change.production.qty',
-            'mrp.production',
-            'mrp.production.product.line',
-            'mrp.unbuild',
-            'change.production.qty',
-            'sale.forecast.indirect',
-            'sale.forecast',
+        tables = [
+            'mrp_workcenter_productivity',
+            'mrp_workorder',
+            'mrp_production_workcenter_line',
+            'change_production_qty',
+            'mrp_production',
+            'mrp_production_product_line',
+            'mrp_unbuild',
         ]
-        seqs = [
-            'mrp.',
-        ]
-        return self.remove_data(to_removes, seqs)
+        for t in tables:
+            self._truncate_table(t)
+        self._reset_sequences(['mrp'])
+        return True
 
     def remove_mrp_bom(self):
-        to_removes = [
-            'mrp.bom.line',
-            'mrp.bom',
-        ]
-        seqs = []
-        return self.remove_data(to_removes, seqs)
+        tables = ['mrp_bom_line', 'mrp_bom']
+        for t in tables:
+            self._truncate_table(t)
+        return True
 
     def remove_inventory(self):
-        to_removes = [
-            'stock.quant',
-            'stock.move.line',
-            'stock.package_level',
-            'stock.quantity.history',
-            'stock.quant.package',
-            'stock.move',
-            'stock.picking',
-            'stock.scrap',
-            'stock.picking.batch',
-            'stock.inventory.line',
-            'stock.inventory',
-            'stock.valuation.layer',
-            'stock.production.lot',
-            'procurement.group',
+        # Strict order: Quant/MoveLine -> Move -> Picking -> Lot -> Package
+        tables = [
+            'stock_quant',
+            'stock_move_line',
+            'stock_package_level',
+            'stock_quantity_history',
+            'stock_valuation_layer', # Important for accounting consistency
+            'stock_move',
+            'stock_picking',
+            'stock_scrap',
+            'stock_picking_batch',
+            'stock_inventory_line',
+            'stock_inventory',
+            'stock_lot', # Odoo 17 uses stock_lot
+            'stock_production_lot', # Legacy
+            'procurement_group',
         ]
-        seqs = [
-            'stock.',
-            'picking.',
-            'procurement.group',
-            'product.tracking.default',
-            'WH/',
-        ]
-        return self.remove_data(to_removes, seqs)
+        for t in tables:
+            self._truncate_table(t)
+        self._reset_sequences(['stock', 'picking', 'WH/'])
+        return True
 
     def remove_account(self):
-        to_removes = [
-            'payment.transaction',
-            'account.bank.statement.line',
-            'account.payment',
-            'account.analytic.line',
-            'account.analytic.account',
-            'account.partial.reconcile',
-            'account.move.line',
-            'hr.expense.sheet',
-            'account.move',
+        # Accounting is the most dangerous. Order: Payments/Lines -> Moves -> Journals/Taxes
+        tables = [
+            'payment_transaction',
+            'account_bank_statement_line',
+            'account_payment',
+            'account_analytic_line',
+            'account_partial_reconcile',
+            'account_move_line',
+            'account_move',
+            'account_bank_statement',
         ]
-        res = self.remove_data(to_removes, [])
-        domain = [
-            ('company_id', '=', self.env.company.id),
-            '|', ('code', '=ilike', 'account.%'),
-            '|', ('prefix', '=ilike', 'BNK1/%'),
-            '|', ('prefix', '=ilike', 'CSH1/%'),
-            '|', ('prefix', '=ilike', 'INV/%'),
-            '|', ('prefix', '=ilike', 'EXCH/%'),
-            '|', ('prefix', '=ilike', 'MISC/%'),
-            '|', ('prefix', '=ilike', '账单/%'),
-            ('prefix', '=ilike', '杂项/%')
-        ]
-        try:
-            seqs = self.env['ir.sequence'].search(domain)
-            if seqs.exists():
-                seqs.write({
-                    'number_next': 1,
-                })
-        except Exception as e:
-            _logger.error('reset sequence data error: %s,%s', domain, e)
-        return res
+        for t in tables:
+            self._truncate_table(t)
+        
+        # Reset Sequences
+        company_id = self.env.company.id
+        self.env.cr.execute("""
+            UPDATE ir_sequence SET number_next = 1 
+            WHERE company_id = %s AND (
+                code LIKE 'account.%%' OR 
+                prefix LIKE 'BNK1/%%' OR 
+                prefix LIKE 'CSH1/%%' OR 
+                prefix LIKE 'INV/%%' OR 
+                prefix LIKE 'EXCH/%%' OR 
+                prefix LIKE 'MISC/%%'
+            );
+        """, (company_id,))
+        self.env.cr.commit()
+        return True
 
     def remove_account_chart(self):
+        """Completely wipes accounting configuration. Use with extreme caution."""
         company_id = self.env.company.id
-        self = self.with_context(force_company=company_id, company_id=company_id)
-        to_removes = [
-            'res.partner.bank',
-            'account.move.line',
-            'account.invoice',
-            'account.payment',
-            'account.bank.statement',
-            'account.tax.account.tag',
-            'account.tax',
-            'account.account.account.tag',
-            'wizard_multi_charts_accounts',
-            'account.journal',
-            'account.account',
+        
+        # 1. Clear Properties (IrValues/Defaults)
+        self.env.cr.execute("""
+            DELETE FROM ir_default 
+            WHERE field_id IN (
+                SELECT id FROM ir_model_fields 
+                WHERE model = 'product.template' AND name IN ('taxes_id', 'supplier_taxes_id')
+            ) AND company_id = %s;
+        """, (company_id,))
+        
+        # 2. Clear Journal Bank Links
+        self.env.cr.execute("UPDATE account_journal SET bank_account_id = NULL WHERE company_id = %s;", (company_id,))
+        
+        # 3. Clear Partner Properties
+        self.env.cr.execute("""
+            UPDATE res_partner 
+            SET property_account_receivable_id = NULL, 
+                property_account_payable_id = NULL 
+            WHERE company_id = %s OR company_id IS NULL;
+        """, (company_id,))
+
+        # 4. Clear Category/Product Properties
+        self.env.cr.execute("""
+            UPDATE product_category 
+            SET property_account_income_categ_id = NULL, 
+                property_account_expense_categ_id = NULL,
+                property_stock_account_input_categ_id = NULL,
+                property_stock_account_output_categ_id = NULL,
+                property_stock_valuation_account_id = NULL;
+        """)
+        
+        self.env.cr.execute("""
+            UPDATE product_template 
+            SET property_account_income_id = NULL, 
+                property_account_expense_id = NULL;
+        """)
+
+        self.env.cr.commit()
+
+        # 5. Delete Accounting Config Tables
+        tables = [
+            'res_partner_bank',
+            'account_tax',
+            'account_tax_account_tag',
+            'account_account_tag',
+            'account_journal',
+            'account_account',
         ]
-        try:
-            field1 = self.env['ir.model.fields']._get('product.template', "taxes_id").id
-            field2 = self.env['ir.model.fields']._get('product.template', "supplier_taxes_id").id
-
-            sql = "delete from ir_default where (field_id = %s or field_id = %s) and company_id=%d" \
-                  % (field1, field2, company_id)
-            sql2 = "update account_journal set bank_account_id=NULL where company_id=%d;" % company_id
-            self._cr.execute(sql)
-            self._cr.execute(sql2)
-
-            self._cr.commit()
-        except Exception as e:
-            _logger.error('remove data error: %s,%s', 'account_chart: set tax and account_journal', e)
-        if self.env['ir.model']._get('pos.config'):
-            self.env['pos.config'].write({
-                'journal_id': False,
-            })
-        try:
-            rec = self.env['res.partner'].search([])
-            for r in rec:
-                r.write({
-                    'property_account_receivable_id': None,
-                    'property_account_payable_id': None,
-                })
-        except Exception as e:
-            _logger.error('remove data error: %s,%s', 'account_chart', e)
-        try:
-            rec = self.env['product.category'].search([])
-            for r in rec:
-                r.write({
-                    'property_account_income_categ_id': None,
-                    'property_account_expense_categ_id': None,
-                    'property_account_creditor_price_difference_categ': None,
-                    'property_stock_account_input_categ_id': None,
-                    'property_stock_account_output_categ_id': None,
-                    'property_stock_valuation_account_id': None,
-                })
-        except Exception as e:
-            pass
-        try:
-            rec = self.env['product.template'].search([])
-            for r in rec:
-                r.write({
-                    'property_account_income_id': None,
-                    'property_account_expense_id': None,
-                })
-        except Exception as e:
-            pass
-        try:
-            rec = self.env['stock.location'].search([])
-            for r in rec:
-                r.write({
-                    'valuation_in_account_id': None,
-                    'valuation_out_account_id': None,
-                })
-        except Exception as e:
-            pass
-        seqs = []
-        res = self.remove_data(to_removes, seqs)
-        return res
+        for t in tables:
+            self._truncate_table(t)
+            
+        return True
 
     def remove_project(self):
-        to_removes = [
-            'account.analytic.line',
-            'project.task',
-            'project.forecast',
-            'project.project',
+        tables = [
+            'account_analytic_line',
+            'project_task',
+            'project_forecast',
+            'project_project',
         ]
-        seqs = []
-        return self.remove_data(to_removes, seqs)
+        for t in tables:
+            self._truncate_table(t)
+        return True
 
     def remove_quality(self):
-        to_removes = [
-            'quality.check',
-            'quality.alert',
-        ]
-        seqs = [
-            'quality.check',
-            'quality.alert',
-        ]
-        return self.remove_data(to_removes, seqs)
+        tables = ['quality_check', 'quality_alert']
+        for t in tables:
+            self._truncate_table(t)
+        self._reset_sequences(['quality'])
+        return True
 
     def remove_quality_setting(self):
-        to_removes = [
-            'quality.point',
-            'quality.alert.stage',
-            'quality.alert.team',
-            'quality.point.test_type',
-            'quality.reason',
-            'quality.tag',
+        tables = [
+            'quality_point',
+            'quality_alert_stage',
+            'quality_alert_team',
+            'quality_point_test_type',
+            'quality_reason',
+            'quality_tag',
         ]
-        return self.remove_data(to_removes)
+        for t in tables:
+            self._truncate_table(t)
+        return True
 
     def remove_website(self):
-        to_removes = [
-            'blog.tag.category',
-            'blog.tag',
-            'blog.post',
-            'blog.blog',
-            'product.wishlist',
-            'website.published.multi.mixin',
-            'website.published.mixin',
-            'website.multi.mixin',
-            'website.visitor',
-            'website.redirect',
-            'website.seo.metadata',
+        tables = [
+            'blog_tag_category',
+            'blog_tag',
+            'blog_post',
+            'blog_blog',
+            'product_wishlist',
+            'website_visitor',
+            'website_redirect',
+            'website_seo_metadata',
         ]
-        seqs = []
-        return self.remove_data(to_removes, seqs)
+        for t in tables:
+            self._truncate_table(t)
+        return True
 
     def remove_message(self):
-        to_removes = [
-            'mail.message',
-            'mail.followers',
-            'mail.activity',
-        ]
-        seqs = []
-        return self.remove_data(to_removes, seqs)
+        # Messages are linked to many things. Truncating them is safe if you don't need chat history.
+        tables = ['mail_message', 'mail_followers', 'mail_activity']
+        for t in tables:
+            self._truncate_table(t)
+        return True
 
     def remove_all(self):
-        self.remove_account()
-        self.remove_quality()
-        self.remove_website()
-        self.remove_quality_setting()
-        self.remove_inventory()
-        self.remove_purchase()
-        self.remove_mrp()
-        self.remove_sales()
-        self.remove_project()
-        self.remove_pos()
-        self.remove_expense()
-        self.remove_account_chart()
+        """Executes all removal methods in the correct dependency order."""
+        _logger.warning("STARTING FULL DATABASE CLEANUP. THIS IS IRREVERSIBLE.")
+        
+        # 1. Remove Dependencies (Messages, Logs)
         self.remove_message()
+        
+        # 2. Remove Operational Data (Sales, Purchases, etc.)
+        self.remove_pos()
+        self.remove_sales()
+        self.remove_purchase()
+        self.remove_expense()
+        self.remove_project()
+        
+        # 3. Remove Inventory & MRP (Depends on Products)
+        self.remove_mrp()
+        self.remove_mrp_bom()
+        self.remove_inventory()
+        
+        # 4. Remove Quality & Website
+        self.remove_quality()
+        self.remove_quality_setting()
+        self.remove_website()
+        
+        # 5. Remove Products (Now that no moves/orders reference them)
+        self.remove_product()
+        self.remove_product_attribute()
+        
+        # 6. Remove Accounting (Last, as it depends on everything else)
+        self.remove_account()
+        self.remove_account_chart()
+        
+        # 7. Cleanup
+        self.reset_cat_loc_name()
+        
+        _logger.warning("DATABASE CLEANUP COMPLETED.")
         return True
 
     def reset_cat_loc_name(self):
-        ids = self.env['product.category'].search([
-            ('parent_id', '!=', False)
-        ], order='complete_name')
-        for rec in ids:
-            try:
-                rec._compute_complete_name()
-            except:
-                pass
+        """Recompute names for categories and locations."""
         try:
-            ids = self.env['stock.location'].search([
-                ('location_id', '!=', False),
-                ('usage', '!=', 'views'),
-            ], order='complete_name')
-            for rec in ids:
-                rec._compute_complete_name()
-        except:
-            pass
+            self.env.cr.execute("""
+                UPDATE product_category 
+                SET complete_name = name 
+                WHERE parent_id IS NULL;
+                
+                UPDATE stock_location 
+                SET complete_name = name 
+                WHERE location_id IS NULL OR usage = 'view';
+            """)
+            self.env.cr.commit()
+        except Exception as e:
+            _logger.error("Error resetting names: %s", e)
         return True
